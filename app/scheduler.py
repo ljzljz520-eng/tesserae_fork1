@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from pydantic import ValidationError
 
 from app import background_loops
+from app.state_coordinator import DataStatePaused
 from app.plugin_loader import PluginRegistry
 from app.push import PushManager, PushResult
 from app.scheduled_refresh import ScheduledPlacement, scheduled_placements
@@ -52,6 +53,7 @@ from app.state.schedule_model import Schedule
 if TYPE_CHECKING:  # pragma: no cover - import cycle: the projection reads us
     from app.device_upcoming import UpcomingEvent
     from app.quiet_hours import QuietHoursWindow
+    from app.state_coordinator import DataStateCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -481,6 +483,12 @@ class Scheduler:
         # schedule.
         self._rotation_force_state: dict[str, tuple[datetime, int]] = {}
         self._lock = threading.Lock()
+        # Optional resolver for the process-wide data-state coordinator
+        # (wired by app.app_factory). When set, every tick runs inside a
+        # blocking write session so a backup read barrier / restore
+        # maintenance window pauses ticks instead of racing managed-file
+        # writes. None in unit tests that don't wire one.
+        self._coordinator_provider: Callable[[], DataStateCoordinator | None] | None = None
 
     # A tick still running after this long is reported as stuck, then again
     # every ``_STUCK_TICK_REPEAT_S`` while it stays that way.
@@ -517,7 +525,7 @@ class Scheduler:
             with self._lock:
                 self._tick_started_at = started
             try:
-                self._tick_once(datetime.now(UTC))
+                self._run_gated_tick(datetime.now(UTC))
             except Exception:
                 logger.exception("scheduler tick crashed")
             finally:
@@ -526,6 +534,26 @@ class Scheduler:
                     self._stuck_warned_at = None
             self._note_tick_duration(monotonic() - started)
             self._stop.wait(self._tick)
+
+    def _run_gated_tick(self, now: datetime) -> None:
+        """Run one tick behind the data-state barrier. The session waits
+        while a backup / restore barrier is held, polled on a short timeout
+        so ``stop()`` (or a barrier that outlives several ticks) stays
+        responsive: a tick overlapping a barrier is simply skipped."""
+        provider = self._coordinator_provider
+        coordinator = provider() if provider is not None else None
+        if coordinator is None:
+            self._tick_once(now)
+            return
+        while True:
+            try:
+                with coordinator.write_session("scheduler", block=True, timeout=2.0):
+                    self._tick_once(now)
+                return
+            except DataStatePaused:
+                if self._stop.is_set():
+                    return
+                logger.debug("scheduler tick waiting for the data-state barrier")
 
     def _note_tick_duration(self, elapsed_s: float) -> None:
         """Warn when a tick overran its own interval. Every automated push

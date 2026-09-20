@@ -298,6 +298,127 @@ def test_rollback_with_no_history_raises(tmp_path: Path) -> None:
         u.rollback_last()
 
 
+# ----- coherent-backup gating -----------------------------------------
+
+
+def test_apply_update_aborts_when_backup_not_coherent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive that isn't manifest-certified coherent must never gate a
+    code change: the updater returns failure with the tree untouched."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text("x")
+    cur, tgt = "a" * 40, "b" * 40
+    responses = {
+        ("fetch",): "",
+        ("rev-parse", "HEAD"): cur,
+        ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
+        ("rev-parse", "origin/main"): tgt,
+        ("rev-list", "--count", f"{cur}..{tgt}"): "1",
+        ("log", f"{cur}..{tgt}", "--format=%h %s", "--max-count=20"): "abc one",
+    }
+    u = _FakeUpdater(repo_root=repo, data_root=_new_data_root(tmp_path), responses=responses)
+    fake = _backup.Backup(
+        id="fake-incoherent",
+        path=tmp_path / "fake.zip",
+        bytes=0,
+        created_at=1.0,
+        label=_backup.LABEL_PRE_UPDATE,
+        note="",
+        coherent=False,
+    )
+    monkeypatch.setattr("app.updater._backup.create", lambda *a, **k: fake)
+
+    result = u.apply_update("edge")
+    assert result.ok is False
+    assert "coherent" in str(result.error)
+    assert result.backup_id == "fake-incoherent"
+    # No code mutation happened.
+    assert all(call[0] not in ("pull", "reset") for call in u.git_calls)
+    assert u.pip_called is False
+
+
+def test_apply_update_aborts_when_coherent_backup_cannot_be_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A barrier that can't drain (BackupError) aborts before git moves."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text("x")
+    cur, tgt = "a" * 40, "b" * 40
+    responses = {
+        ("fetch",): "",
+        ("rev-parse", "HEAD"): cur,
+        ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
+        ("rev-parse", "origin/main"): tgt,
+        ("rev-list", "--count", f"{cur}..{tgt}"): "1",
+        ("log", f"{cur}..{tgt}", "--format=%h %s", "--max-count=20"): "abc one",
+    }
+    u = _FakeUpdater(repo_root=repo, data_root=_new_data_root(tmp_path), responses=responses)
+
+    def _raise(*a: object, **k: object) -> object:
+        raise _backup.BackupError("writers did not drain")
+
+    monkeypatch.setattr("app.updater._backup.create", _raise)
+
+    result = u.apply_update("edge")
+    assert result.ok is False
+    assert "coherent backup failed" in str(result.error)
+    assert result.backup_id == ""
+    assert all(call[0] not in ("pull", "reset") for call in u.git_calls)
+    assert u.pip_called is False
+
+
+def test_rollback_last_keeps_serving_when_restore_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If restore() refuses (validation failed before touching live
+    state), rollback must report failure, skip the dep reinstall and let
+    the caller keep this process serving instead of restarting."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text("x")
+    data = _new_data_root(tmp_path)
+    snap = _backup.create(data, label=_backup.LABEL_PRE_UPDATE, note="seed")
+    sha_old, sha_new = "a" * 40, "b" * 40
+    u = _FakeUpdater(
+        repo_root=repo,
+        data_root=data,
+        responses={
+            ("rev-parse", "HEAD"): sha_new,
+            ("reset", "--hard", sha_old): "",
+            ("status", "--porcelain"): "",
+        },
+    )
+    from app.updater import HistoryEntry
+
+    u._record_history(
+        HistoryEntry(
+            at=1.0,
+            from_sha=sha_old,
+            to_sha=sha_new,
+            channel="edge",
+            backup_id=snap.id,
+            pip_changed=True,  # would trigger a reinstall on success
+        )
+    )
+    (data / "core" / "settings.json").write_text("MUTATED-LIVE")
+
+    def _refuse(*a: object, **k: object) -> object:
+        raise _backup.RestoreError("nope")
+
+    monkeypatch.setattr("app.updater._backup.restore", _refuse)
+
+    result = u.rollback_last()
+    assert result.ok is False
+    assert "data restore refused" in str(result.error)
+    assert result.to_sha == sha_old  # code did reset, state did not move
+    # Live data generation is intact; no reinstall, caller must not restart.
+    assert (data / "core" / "settings.json").read_text() == "MUTATED-LIVE"
+    assert u.pip_called is False
+
+
 # ----- restart: POSIX execv vs Windows Popen ---------------------------
 
 

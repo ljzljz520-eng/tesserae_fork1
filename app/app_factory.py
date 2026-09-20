@@ -49,6 +49,7 @@ from app import (
     schedule_routes,
     send_routes,
     settings_routes,
+    state_coordinator as _state_coordinator,
     stats_routes,
     themes_routes,
     touch_monitor_routes,
@@ -460,6 +461,15 @@ def create_app(
     # installed copy of the same id; bundled ids still win over both.
     authored_dir = data_root / "authored"
     authored_dir.mkdir(parents=True, exist_ok=True)
+
+    # Process-wide coordinator for coherent snapshots. Backup's read
+    # barrier / restore's maintenance window pause managed writers through
+    # this one instance (resolved by data root, so app.backup and the
+    # updater find it without being passed it). Created before any store
+    # or background loop exists.
+    coordinator = _state_coordinator.DataStateCoordinator(data_root)
+    _state_coordinator.register_coordinator(coordinator)
+    app.config["STATE_COORDINATOR"] = coordinator
 
     settings = SettingsStore(data_root / "core" / "settings.json")
     app.config["SETTINGS_STORE"] = settings
@@ -1043,6 +1053,8 @@ def create_app(
         paused_provider=lambda: bool(settings.get_section("app").get("automation_paused")),
     )
     app.config["SCHEDULER"] = scheduler
+    # Pause ticks behind backup barriers / restore maintenance windows.
+    scheduler._coordinator_provider = lambda: coordinator
     from app.data_change_refresh import DataChangeRefreshCoordinator
 
     def _refresh_data_change_pages(page_ids: set[str]) -> None:
@@ -1600,5 +1612,54 @@ def create_app(
     @app.get("/healthz")
     def healthz() -> tuple[str, int]:
         return "ok", 200
+
+    # -- data-state coordinator wiring ---------------------------------
+    # Every house-convention store already in app.config (``_path`` plus
+    # a ``_lock``) gets a barrier-time flusher: under the store's lock,
+    # fsync its file, so no atomic tmp+rename can be in flight while the
+    # snapshot walks the tree. Deduplicated (projections share instances).
+    _registered_stores: set[tuple[int, str]] = set()
+    for _config_key, _component in list(app.config.items()):
+        _store_path = getattr(_component, "_path", None)
+        if not isinstance(_store_path, Path) or not hasattr(getattr(_component, "_lock", None), "acquire"):
+            continue
+        try:
+            _store_path.relative_to(data_root)
+        except ValueError:
+            continue
+        _dedupe = (id(_component), str(_store_path))
+        if _dedupe in _registered_stores:
+            continue
+        _registered_stores.add(_dedupe)
+        coordinator.register_store(f"store:{_config_key}", _component, _store_path)
+
+    # The push pipeline is NOT registered as a raw component lock:
+    # updater / restore routes hold PushManager._lock themselves
+    # (non-reentrant) and the barrier re-acquiring it would self-
+    # deadlock. Instead every push turn enters a "push" write session
+    # before taking that lock (app.push.PushManager._state_gate), so
+    # the barrier drains an in-flight push via the session counter.
+
+    @app.before_request
+    def _reject_writes_during_barrier() -> Response | None:
+        """503 every state-changing HTTP request while a backup barrier
+        or restore maintenance window is held (the request that *takes*
+        the barrier passes this gate: the flag flips only once it is
+        inside backup.create / backup.restore). Read-only requests and
+        the health probe stay available."""
+        from flask import request as _barrier_request
+
+        if _barrier_request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+            return None
+        if not coordinator.is_blocking():
+            return None
+        resp = Response(
+            "Tesserae is taking a coherent backup or restoring state; "
+            "state-changing requests are paused for a few seconds. Try again.",
+            status=503,
+            mimetype="text/plain",
+        )
+        resp.headers["Retry-After"] = "5"
+        return resp
 
     return app

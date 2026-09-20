@@ -152,7 +152,39 @@ def _serve(argv: list[str] | None = None) -> None:
     _ha_options = load_options()
     if _ha_options is not None:
         apply_log_level(_ha_options)
-    app = create_app(dev=args.dev)
+
+    # Same data-root precedence the factory uses (CLI never passes one
+    # explicitly). Before constructing the app: complete or unwind a
+    # generation exchange the previous process was killed mid-swap.
+    from pathlib import Path as _Path
+
+    from app import backup as _backup
+
+    _env_root = os.environ.get("TESSERAE_DATA_ROOT", "").strip()
+    _data_root = _Path(_env_root) if _env_root else REPO_ROOT / "data"
+    _pending_restore = _backup.recover_pending(_data_root)
+    try:
+        app = create_app(dev=args.dev)
+    except Exception:
+        # The restored generation committed but never reached a healthy
+        # boot: return to the retained old generation instead of
+        # continuing to serve (or crash-loop on) the bad state.
+        _rolled_back = _backup.rollback_unverified(_data_root)
+        if _rolled_back is not None:
+            logging.getLogger(__name__).error(
+                "startup failed on restored generation %s; returned to the previous generation",
+                _rolled_back,
+            )
+        raise
+    # Construction (routes, migrations, transport wiring) succeeded on
+    # the new generation: certify it so the retained old generation is
+    # kept only as a manual rollback artifact.
+    if (
+        isinstance(_pending_restore, dict)
+        and _pending_restore.get("phase") == "committed"
+        and not _pending_restore.get("verified")
+    ):
+        _backup.mark_verified(_data_root)
 
     if args.dev:
         logging.getLogger(__name__).info(

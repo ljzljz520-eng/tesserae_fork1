@@ -367,12 +367,35 @@ class Updater:
                     pip_changed=False,
                 )
 
-            # 1. Snapshot data/ before touching anything.
-            backup = _backup.create(
-                self._data,
-                label=_backup.LABEL_PRE_UPDATE,
-                note=f"{check.current_sha[:7]} → {check.target_sha[:7]} ({channel})",
-            )
+            # 1. Coherent snapshot of data/ before touching anything.
+            # A barrier that can't drain managed writers aborts here,
+            # BEFORE the code tree moves, and an archive that isn't
+            # manifest-certified coherent must never gate an update
+            # (rolling back onto an incoherent snapshot is unsafe).
+            try:
+                backup = _backup.create(
+                    self._data,
+                    label=_backup.LABEL_PRE_UPDATE,
+                    note=f"{check.current_sha[:7]} → {check.target_sha[:7]} ({channel})",
+                )
+            except _backup.BackupError as err:
+                return UpdateResult(
+                    ok=False,
+                    from_sha=check.current_sha,
+                    to_sha=check.current_sha,
+                    backup_id="",
+                    pip_changed=False,
+                    error=f"coherent backup failed, code unchanged: {err}",
+                )
+            if not backup.coherent:
+                return UpdateResult(
+                    ok=False,
+                    from_sha=check.current_sha,
+                    to_sha=check.current_sha,
+                    backup_id=backup.id,
+                    pip_changed=False,
+                    error="backup manifest is not marked coherent; refusing to change code",
+                )
 
             from_sha = check.current_sha
             pre_pyproject = self._show_blob(from_sha, "pyproject.toml")
@@ -450,8 +473,26 @@ class Updater:
                     error=str(err),
                 )
             if last.backup_id:
-                with contextlib.suppress(FileNotFoundError):
+                try:
                     _backup.restore(self._data, last.backup_id)
+                except FileNotFoundError:
+                    # History references a snapshot that has since been
+                    # deleted; code is still rolled back, surface ok.
+                    pass
+                except _backup.RestoreError as err:
+                    # Snapshot failed validation: restore() refuses before
+                    # touching live state, so the CURRENT data generation is
+                    # intact. Do NOT reinstall deps or let the caller restart
+                    # into the rolled-back code against that state - return the
+                    # failure and keep this process serving.
+                    return UpdateResult(
+                        ok=False,
+                        from_sha=current_sha,
+                        to_sha=last.from_sha,
+                        backup_id=last.backup_id,
+                        pip_changed=False,
+                        error=f"data restore refused, live state kept: {err}",
+                    )
             if last.pip_changed:
                 # The previous revision may have older deps installed
                 # against newer pyproject, reinstall to align.

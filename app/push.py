@@ -44,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -82,6 +82,7 @@ from app.renderer import (
     to_loopback_url,
 )
 from app.renderer_loader import Renderer, RendererRegistry
+from app import state_coordinator as _state_coordinator
 from app.state.event_log import EventLog
 from app.state.page_store import PageStore, Panel
 from app.state.settings_store import SettingsStore
@@ -1519,6 +1520,24 @@ class PushManager:
 
     # -- public API ------------------------------------------------------
 
+    @contextlib.contextmanager
+    def _state_gate(self) -> Iterator[None]:
+        """Hold a data-state write session for one whole push turn.
+
+        Entered BEFORE ``self._lock`` so a backup barrier can never
+        observe a thread holding the push lock but standing past the
+        paused gate: that writer would be free to mutate managed state
+        during the staged copy. Null context when no coordinator is
+        registered (unit tests)."""
+        coordinator = _state_coordinator.coordinator_for(
+            self._renders_dir.parent.parent, create=False
+        )
+        if coordinator is None:
+            yield
+            return
+        with coordinator.write_session("push", block=True):
+            yield
+
     def push(
         self,
         page_id: str,
@@ -1555,32 +1574,33 @@ class PushManager:
         # firing twice in a row for the same page doesn't paint
         # twice. Manual / user-initiated pushes should pass
         # ``bypass_coalesce=True`` so they always fire.
-        coalesce_key: str | None = None
-        if device_ids and len(device_ids) == 1:
-            coalesce_key = next(iter(device_ids))
-        supersede = self._acquire_or_supersede(
-            device_id=coalesce_key,
-            source=source,
-            target=page_id,
-            bypass_coalesce=bypass_coalesce,
-        )
-        if supersede is not None:
-            result = PushResult(
-                status="superseded",
-                page_id=page_id,
-                error="newer push for the same device took priority",
+        with self._state_gate():
+            coalesce_key: str | None = None
+            if device_ids and len(device_ids) == 1:
+                coalesce_key = next(iter(device_ids))
+            supersede = self._acquire_or_supersede(
+                device_id=coalesce_key,
+                source=source,
+                target=page_id,
+                bypass_coalesce=bypass_coalesce,
             )
-        else:
-            try:
-                result = self._push_page_locked(
-                    page_id,
-                    device_ids=device_ids,
-                    respect_quiet_hours=respect_quiet_hours,
-                    source=source,
-                    force_publish=force_publish,
+            if supersede is not None:
+                result = PushResult(
+                    status="superseded",
+                    page_id=page_id,
+                    error="newer push for the same device took priority",
                 )
-            finally:
-                self._lock.release()
+            else:
+                try:
+                    result = self._push_page_locked(
+                        page_id,
+                        device_ids=device_ids,
+                        respect_quiet_hours=respect_quiet_hours,
+                        source=source,
+                        force_publish=force_publish,
+                    )
+                finally:
+                    self._lock.release()
         self._notify(result)
         return result
 
@@ -1629,33 +1649,34 @@ class PushManager:
         on the live-render entry so the touch-v3 spec and the post-action
         reconcile can find the page behind the frame; without it the
         frame is an anonymous image and the spec comes back empty."""
-        supersede = self._acquire_or_supersede(
-            device_id=device_id,
-            source=source,
-            target=source_label,
-            bypass_coalesce=bypass_coalesce,
-        )
-        if supersede is not None:
-            result = PushResult(
-                status="superseded",
-                page_id=source_label,
-                error="newer push for the same device took priority",
+        with self._state_gate():
+            supersede = self._acquire_or_supersede(
+                device_id=device_id,
+                source=source,
+                target=source_label,
+                bypass_coalesce=bypass_coalesce,
             )
-        else:
-            try:
-                result = self._push_bytes_locked(
-                    image_bytes,
-                    source_label,
-                    source=source,
-                    device_id=device_id,
-                    page_id=page_id,
-                    fit=fit,
-                    rotate=rotate,
-                    force_publish=force_publish,
-                    framing=framing,
+            if supersede is not None:
+                result = PushResult(
+                    status="superseded",
+                    page_id=source_label,
+                    error="newer push for the same device took priority",
                 )
-            finally:
-                self._lock.release()
+            else:
+                try:
+                    result = self._push_bytes_locked(
+                        image_bytes,
+                        source_label,
+                        source=source,
+                        device_id=device_id,
+                        page_id=page_id,
+                        fit=fit,
+                        rotate=rotate,
+                        force_publish=force_publish,
+                        framing=framing,
+                    )
+                finally:
+                    self._lock.release()
         self._notify(result)
         return result
 
@@ -1676,35 +1697,36 @@ class PushManager:
         the Companion route passes ``False`` for the strict public-only
         policy, refusing private / loopback / link-local / reserved hosts,
         including on redirect hops."""
-        supersede = self._acquire_or_supersede(
-            device_id=device_id,
-            source="url",
-            target=url,
-            bypass_coalesce=bypass_coalesce,
-        )
-        if supersede is not None:
-            result = PushResult(
-                status="superseded",
-                page_id=url,
-                error="newer push for the same device took priority",
+        with self._state_gate():
+            supersede = self._acquire_or_supersede(
+                device_id=device_id,
+                source="url",
+                target=url,
+                bypass_coalesce=bypass_coalesce,
             )
-        else:
-            try:
+            if supersede is not None:
+                result = PushResult(
+                    status="superseded",
+                    page_id=url,
+                    error="newer push for the same device took priority",
+                )
+            else:
                 try:
-                    image_bytes = self._fetch_remote_image(url, allow_local=allow_local)
-                except Exception as err:
-                    result = self._log_failure(source="url", target=url, error=f"fetch: {err}")
-                else:
-                    result = self._push_bytes_locked(
-                        image_bytes,
-                        url,
-                        source="url",
-                        device_id=device_id,
-                        fit=fit,
-                        rotate=rotate,
-                    )
-            finally:
-                self._lock.release()
+                    try:
+                        image_bytes = self._fetch_remote_image(url, allow_local=allow_local)
+                    except Exception as err:
+                        result = self._log_failure(source="url", target=url, error=f"fetch: {err}")
+                    else:
+                        result = self._push_bytes_locked(
+                            image_bytes,
+                            url,
+                            source="url",
+                            device_id=device_id,
+                            fit=fit,
+                            rotate=rotate,
+                        )
+                finally:
+                    self._lock.release()
         self._notify(result)
         return result
 
@@ -1740,72 +1762,73 @@ class PushManager:
             assert_operator_url(url) if allow_local else assert_public_url(url)
         except BlockedURLError as err:
             return self._log_failure(source="webpage", target=url, error=str(err))
-        supersede = self._acquire_or_supersede(
-            device_id=device_id,
-            source="webpage",
-            target=url,
-            bypass_coalesce=bypass_coalesce,
-        )
-        if supersede is not None:
-            result = PushResult(
-                status="superseded",
-                page_id=url,
-                error="newer push for the same device took priority",
+        with self._state_gate():
+            supersede = self._acquire_or_supersede(
+                device_id=device_id,
+                source="webpage",
+                target=url,
+                bypass_coalesce=bypass_coalesce,
             )
-        else:
-            try:
-                started = time.monotonic()
-                extra_headers, header_user_agent = split_user_agent(headers or {})
-                target_origin = origin_of(url)
-                if extra_headers or header_user_agent:
-                    logger.info(
-                        "webpage push %s: applying %s%s",
-                        url,
-                        header_summary(extra_headers) or "no extra headers",
-                        ", user-agent override" if header_user_agent else "",
-                    )
+            if supersede is not None:
+                result = PushResult(
+                    status="superseded",
+                    page_id=url,
+                    error="newer push for the same device took priority",
+                )
+            else:
                 try:
-                    composition = render_to_png(
-                        RenderRequest(
-                            url=url,
-                            viewport_w=viewport_w,
-                            viewport_h=viewport_h,
-                            timezone_id=self._render_timezone_id(),
-                            # External URL render, not our /compose/ page.
-                            # Tells the renderer to skip the 15s composer-
-                            # mount wait and to use networkidle for the
-                            # initial goto so SPAs hydrate before screenshot.
-                            is_composer=False,
-                            # Strict callers (Companion) refuse non-public hosts
-                            # on every hop the browser follows internally.
-                            allow_local=allow_local,
-                            headers_by_origin=(
-                                {target_origin: extra_headers}
-                                if (extra_headers and target_origin)
-                                else None
+                    started = time.monotonic()
+                    extra_headers, header_user_agent = split_user_agent(headers or {})
+                    target_origin = origin_of(url)
+                    if extra_headers or header_user_agent:
+                        logger.info(
+                            "webpage push %s: applying %s%s",
+                            url,
+                            header_summary(extra_headers) or "no extra headers",
+                            ", user-agent override" if header_user_agent else "",
+                        )
+                    try:
+                        composition = render_to_png(
+                            RenderRequest(
+                                url=url,
+                                viewport_w=viewport_w,
+                                viewport_h=viewport_h,
+                                timezone_id=self._render_timezone_id(),
+                                # External URL render, not our /compose/ page.
+                                # Tells the renderer to skip the 15s composer-
+                                # mount wait and to use networkidle for the
+                                # initial goto so SPAs hydrate before screenshot.
+                                is_composer=False,
+                                # Strict callers (Companion) refuse non-public hosts
+                                # on every hop the browser follows internally.
+                                allow_local=allow_local,
+                                headers_by_origin=(
+                                    {target_origin: extra_headers}
+                                    if (extra_headers and target_origin)
+                                    else None
+                                ),
+                                user_agent=header_user_agent,
                             ),
-                            user_agent=header_user_agent,
-                        ),
-                        pool=self._browser_pool_fn(),
-                    )
-                except Exception as err:
-                    result = self._log_failure(
-                        source="webpage",
-                        target=url,
-                        error=f"render: {err}",
-                        duration_s=time.monotonic() - started,
-                    )
-                else:
-                    result = self._push_bytes_locked(
-                        composition,
-                        url,
-                        source="webpage",
-                        started=started,
-                        device_id=device_id,
-                        fit=fit,
-                    )
-            finally:
-                self._lock.release()
+                            pool=self._browser_pool_fn(),
+                        )
+                    except Exception as err:
+                        result = self._log_failure(
+                            source="webpage",
+                            target=url,
+                            error=f"render: {err}",
+                            duration_s=time.monotonic() - started,
+                        )
+                    else:
+                        result = self._push_bytes_locked(
+                            composition,
+                            url,
+                            source="webpage",
+                            started=started,
+                            device_id=device_id,
+                            fit=fit,
+                        )
+                finally:
+                    self._lock.release()
         self._notify(result)
         return result
 

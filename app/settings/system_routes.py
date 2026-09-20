@@ -16,6 +16,7 @@ from werkzeug.wrappers import Response
 
 from app import backup as _backup_mod
 from app import install_id as install_id_module
+from app import state_coordinator as _state_coordinator
 from app import updater as _updater_mod
 
 from ._shared import (
@@ -106,7 +107,7 @@ def system_backup_create() -> Response:
     note = (request.form.get("note") or "").strip()[:200]
     try:
         backup = _backup_mod.create(data_root(), label=_backup_mod.LABEL_MANUAL, note=note)
-    except OSError as err:
+    except (_backup_mod.BackupError, OSError) as err:
         flash(f"Backup failed: {err}", "error")
         return system_redirect()
     flash(f"Backup created: {backup.id} ({backup.bytes // 1024} KB).", "ok")
@@ -135,18 +136,21 @@ def system_backup_restore(backup_id: str) -> Response:
     refused = refuse_in_dev()
     if refused is not None:
         return refused
-    push_mgr = push_manager()
-    if not push_mgr._lock.acquire(blocking=True, timeout=10):
-        flash("Another push is in flight, try again in a moment.", "error")
-        return system_redirect()
+    # The restore's maintenance window drains the push pipeline itself
+    # (push turns ride data-state write sessions), so the raw push lock
+    # must NOT be held here - it is non-reentrant and the coordinator
+    # would self-deadlock acquiring it.
     try:
-        try:
-            _backup_mod.restore(data_root(), backup_id)
-        except (FileNotFoundError, ValueError, OSError) as err:
-            flash(f"Restore failed: {err}", "error")
-            return system_redirect()
-    finally:
-        push_mgr._lock.release()
+        _backup_mod.restore(data_root(), backup_id)
+    except FileNotFoundError:
+        flash(f"No backup named {backup_id}.", "error")
+        return system_redirect()
+    except (_backup_mod.RestoreError, ValueError, OSError) as err:
+        flash(f"Restore failed: {err}", "error")
+        return system_redirect()
+    except _state_coordinator.DataStatePaused as err:
+        flash(f"Another backup/restore is already in progress: {err}", "error")
+        return system_redirect()
     flash(f"Restored from {backup_id}. Restarting…", "ok")
     updater().restart(delay_s=1.5)
     return system_redirect()
@@ -173,7 +177,7 @@ def system_data_export() -> Response:
     installs, restore-from-existing-backup is the in-place flow."""
     try:
         backup = _backup_mod.create(data_root(), label=_backup_mod.LABEL_MANUAL, note="export")
-    except OSError as err:
+    except (_backup_mod.BackupError, OSError) as err:
         flash(f"Export failed: {err}", "error")
         return system_redirect()
     try:
@@ -236,11 +240,9 @@ def system_data_import() -> Response:
 
     # Stage the upload into the backups dir under a synthetic id so the
     # existing restore() pipeline can pick it up, keeps the restore
-    # path consistent with the in-place restore flow.
-    push_mgr = push_manager()
-    if not push_mgr._lock.acquire(blocking=True, timeout=10):
-        flash("Another push is in flight, try again in a moment.", "error")
-        return system_redirect()
+    # path consistent with the in-place restore flow. The restore's
+    # maintenance window drains the push pipeline itself, so no raw
+    # push lock is acquired here (it would self-deadlock the barrier).
     import time as _time
 
     ts = _time.strftime("%Y%m%d-%H%M%S")
@@ -249,14 +251,15 @@ def system_data_import() -> Response:
     staged = backups_dir / f"{ts}-import.zip"
     staged.write_bytes(raw)
     try:
-        try:
-            _backup_mod.restore(data_root(), staged.stem)
-        except (FileNotFoundError, ValueError, OSError) as err:
-            flash(f"Import failed: {err}", "error")
-            staged.unlink(missing_ok=True)
-            return system_redirect()
-    finally:
-        push_mgr._lock.release()
+        _backup_mod.restore(data_root(), staged.stem)
+    except (FileNotFoundError, ValueError, OSError) as err:
+        flash(f"Import failed: {err}", "error")
+        staged.unlink(missing_ok=True)
+        return system_redirect()
+    except _state_coordinator.DataStatePaused as err:
+        flash(f"Another backup/restore is already in progress: {err}", "error")
+        staged.unlink(missing_ok=True)
+        return system_redirect()
     # restore() leaves the staged file in place (it's preserved as part
     # of the backups dir during the rebuild). Drop it now so it doesn't
     # show up in the Backups list as a confusing one-time entry.

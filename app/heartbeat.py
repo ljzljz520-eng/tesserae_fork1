@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from flask import Flask
 
 from app import install_id as _install_id
 from app import online
+from app import state_coordinator as _state_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,20 @@ _channel_cache: str | None = None
 
 def _state_path(data_root: Path) -> Path:
     return data_root / "core" / "heartbeat.json"
+
+
+@contextlib.contextmanager
+def _state_gate(data_root: Path) -> Iterator[None]:
+    """Serialise heartbeat state writes against a backup / restore
+    barrier. A blocking session pauses this (daemon) writer for the
+    barrier's duration; when no coordinator is registered (unit
+    tests) this is a null context."""
+    coordinator = _state_coordinator.coordinator_for(Path(data_root), create=False)
+    if coordinator is None:
+        yield
+        return
+    with coordinator.write_session("heartbeat", block=True, timeout=5.0):
+        yield
 
 
 def _next_due(data_root: Path) -> float | None:
@@ -510,30 +526,35 @@ def maybe_send(app: Flask, *, now: float | None = None) -> bool:
         data_root = app.config["DATA_ROOT"]
         now = time.time() if now is None else now
 
-        payload = build_payload(app)
-        sent = online.send_heartbeat(payload)
-        # ~daily with jitter on success; retry sooner on a transient failure.
-        if sent:
-            nxt = now + _INTERVAL_SECONDS + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
-        else:
-            nxt = now + _RETRY_SECONDS
-        _save_next_due(data_root, nxt)
+        # Whole send + persistence rides one gated session: a barrier
+        # taken while the HTTP POST is in flight drains it, and the
+        # next_due file can't land mid-snapshot after the network call.
+        with _state_gate(Path(data_root)):
+            payload = build_payload(app)
+            sent = online.send_heartbeat(payload)
+            # ~daily with jitter on success; retry sooner on a transient failure.
+            if sent:
+                nxt = now + _INTERVAL_SECONDS + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
+            else:
+                nxt = now + _RETRY_SECONDS
+            _save_next_due(data_root, nxt)
 
     event_log = app.config.get("EVENT_LOG")
     if event_log is not None:
-        with contextlib.suppress(Exception):
-            event_log.record(
-                type="telemetry",
-                source="heartbeat",
-                target="api.tesserae.ink",
-                status="sent" if sent else "failed",
-                extra={
-                    "endpoint": "heartbeat",
-                    "version": payload["version"],
-                    "deploy": payload["deploy"],
-                    "devices": payload["devices"],
-                },
-            )
+        with _state_gate(Path(data_root)):
+            with contextlib.suppress(Exception):
+                event_log.record(
+                    type="telemetry",
+                    source="heartbeat",
+                    target="api.tesserae.ink",
+                    status="sent" if sent else "failed",
+                    extra={
+                        "endpoint": "heartbeat",
+                        "version": payload["version"],
+                        "deploy": payload["deploy"],
+                        "devices": payload["devices"],
+                    },
+                )
     return sent
 
 
